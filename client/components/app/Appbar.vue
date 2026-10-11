@@ -24,6 +24,12 @@
 
         <widgets-notification-widget class="hidden md:block" />
 
+        <button class="hover:text-gray-200 cursor-pointer w-8 h-8 flex items-center justify-center mx-1" :class="{ 'text-success': isInListeningParty }" :aria-label="$strings.LabelListenTogether" @click="$store.commit('listenTogether/setShowModal', true)">
+          <ui-tooltip :text="$strings.LabelListenTogether" direction="bottom" class="flex items-center">
+            <span class="material-symbols text-2xl" :class="{ fill: isInListeningParty }">groups</span>
+          </ui-tooltip>
+        </button>
+
         <nuxt-link v-if="currentLibrary" to="/config/stats" class="hover:text-gray-200 cursor-pointer w-8 h-8 hidden sm:flex items-center justify-center mx-1">
           <ui-tooltip :text="$strings.HeaderYourStats" direction="bottom" class="flex items-center">
             <span class="material-symbols text-2xl" aria-label="User Stats" role="button">&#xe01d;</span>
@@ -91,6 +97,9 @@ export default {
     }
   },
   computed: {
+    isInListeningParty() {
+      return this.$store.getters['listenTogether/isInParty']
+    },
     currentLibrary() {
       return this.$store.getters['libraries/getCurrentLibrary']
     },

@@ -3,6 +3,7 @@ const Logger = require('./Logger')
 const Database = require('./Database')
 const TokenManager = require('./auth/TokenManager')
 const CoverSearchManager = require('./managers/CoverSearchManager')
+const ListenTogetherManager = require('./managers/ListenTogetherManager')
 const { LogLevel } = require('./utils/constants')
 
 /**
@@ -20,6 +21,10 @@ class SocketAuthority {
 
     /** @type {Object.<string, SocketClient>} */
     this.clients = {}
+
+    this.listenTogetherManager = new ListenTogetherManager((socketId, evt, data) => {
+      this.clients[socketId]?.socket.emit(evt, data)
+    })
   }
 
   /**
@@ -209,9 +214,19 @@ class SocketAuthority {
         })
         socket.on('remove_log_listener', () => Logger.removeSocketListener(socket.id))
 
+        // Listen together
+        socket.on('listen_together_create', (payload, ack) => this.handleListenTogetherEvent(socket, 'create', payload, ack))
+        socket.on('listen_together_join', (payload, ack) => this.handleListenTogetherEvent(socket, 'join', payload, ack))
+        socket.on('listen_together_leave', (payload, ack) => this.handleListenTogetherEvent(socket, 'leave', payload, ack))
+        socket.on('listen_together_end', (payload, ack) => this.handleListenTogetherEvent(socket, 'end', payload, ack))
+        socket.on('listen_together_update', (payload, ack) => this.handleListenTogetherEvent(socket, 'update', payload, ack))
+        socket.on('listen_together_invite', (payload, ack) => this.handleListenTogetherEvent(socket, 'invite', payload, ack))
+        socket.on('listen_together_users', (payload, ack) => this.handleListenTogetherEvent(socket, 'users', payload, ack))
+
         // Sent automatically from socket.io clients
         socket.on('disconnect', (reason) => {
           Logger.removeSocketListener(socket.id)
+          this.listenTogetherManager.handleDisconnect(socket.id)
 
           const _client = this.clients[socket.id]
           if (!_client) {
@@ -359,6 +374,147 @@ class SocketAuthority {
       initialPayload.usersOnline = this.getUsersOnline()
     }
     client.socket.emit('init', initialPayload)
+  }
+
+  /**
+   * Get library item for a listen together party if the user can access it
+   *
+   * @param {import('./models/User')} user
+   * @param {string} libraryItemId
+   * @param {string} [episodeId]
+   * @returns {Promise<{ error?: string, title?: string }>}
+   */
+  async getListenTogetherItem(user, libraryItemId, episodeId) {
+    if (!libraryItemId || typeof libraryItemId !== 'string') return { error: 'Invalid library item' }
+    const libraryItem = await Database.libraryItemModel.getExpandedById(libraryItemId)
+    if (!libraryItem || !user.checkCanAccessLibraryItem(libraryItem)) return { error: 'Library item not found' }
+
+    if (episodeId) {
+      const episode = libraryItem.media.podcastEpisodes?.find((ep) => ep.id === episodeId)
+      if (!episode) return { error: 'Episode not found' }
+      return { title: episode.title || libraryItem.media.title }
+    }
+    if (libraryItem.isPodcast) return { error: 'Episode required for podcasts' }
+    return { title: libraryItem.media.title }
+  }
+
+  /**
+   * Handle "Listen together" socket events
+   * Every event responds through the socket.io acknowledgement callback with either `{ error }` or a result
+   *
+   * @param {SocketIO.Socket} socket
+   * @param {string} event
+   * @param {any} payload
+   * @param {Function} [ack]
+   */
+  async handleListenTogetherEvent(socket, event, payload, ack) {
+    if (typeof payload === 'function') {
+      ack = payload
+      payload = {}
+    }
+    const respond = typeof ack === 'function' ? ack : () => {}
+    payload = payload && typeof payload === 'object' ? payload : {}
+
+    const client = this.clients[socket.id]
+    if (!client?.user) {
+      Logger.warn(`[SocketAuthority] Unauthorized listen_together_${event} socket event from socket ${socket.id}`)
+      return respond({ error: 'Unauthorized' })
+    }
+    const manager = this.listenTogetherManager
+
+    try {
+      switch (event) {
+        case 'create': {
+          const item = await this.getListenTogetherItem(client.user, payload.libraryItemId, payload.episodeId)
+          if (item.error) return respond({ error: item.error })
+          const party = manager.createParty(client, { ...payload, title: item.title })
+          return respond({ party: manager.toJSON(party) })
+        }
+        case 'join': {
+          const party = manager.findParty(payload)
+          if (!party) return respond({ error: 'Listening party not found' })
+          const item = await this.getListenTogetherItem(client.user, party.libraryItemId, party.episodeId)
+          if (item.error) return respond({ error: 'You do not have access to the item played in this listening party' })
+          manager.joinParty(client, party)
+          return respond({ party: manager.toJSON(party) })
+        }
+        case 'leave': {
+          manager.leaveParty(client.id)
+          return respond({})
+        }
+        case 'end': {
+          return respond(manager.endParty(client))
+        }
+        case 'update': {
+          if (payload.action === 'load') {
+            const party = manager.getPartyForSocket(client.id)
+            if (!party) return respond({ error: 'Not in a listening party' })
+            // Every member must be able to play the new item
+            const memberUsers = new Map()
+            for (const socketId of party.members.keys()) {
+              const user = this.clients[socketId]?.user
+              if (user) memberUsers.set(user.id, user)
+            }
+            let title = null
+            for (const user of memberUsers.values()) {
+              const item = await this.getListenTogetherItem(user, payload.libraryItemId, payload.episodeId)
+              if (item.error) {
+                return respond({ error: user.id === client.user.id ? item.error : 'Not all members of the listening party can access this item' })
+              }
+              title = item.title
+            }
+            payload = { ...payload, title }
+          }
+          const result = manager.updateState(client, payload)
+          if (result.error) return respond({ error: result.error })
+          return respond({ party: manager.toJSON(result.party) })
+        }
+        case 'invite': {
+          const party = manager.getPartyForSocket(client.id)
+          if (!party) return respond({ error: 'Not in a listening party' })
+          const targetClients = this.getClientsForUser(payload.userId)
+          if (!targetClients.length) return respond({ error: 'User is not online' })
+          const item = await this.getListenTogetherItem(targetClients[0].user, party.libraryItemId, party.episodeId)
+          if (item.error) return respond({ error: 'User does not have access to this item' })
+          targetClients.forEach((c) => {
+            c.socket.emit('listen_together_invite', {
+              partyId: party.id,
+              code: party.code,
+              title: party.title,
+              libraryItemId: party.libraryItemId,
+              episodeId: party.episodeId,
+              userId: client.user.id,
+              username: client.user.username
+            })
+          })
+          return respond({})
+        }
+        case 'users': {
+          // Online users that can be invited to the party of this socket
+          const party = manager.getPartyForSocket(client.id)
+          if (!party) return respond({ error: 'Not in a listening party' })
+          const usersMap = new Map()
+          Object.values(this.clients).forEach((c) => {
+            if (c.user && c.user.id !== client.user.id && c.user.isActive) usersMap.set(c.user.id, c.user)
+          })
+          const users = []
+          for (const user of usersMap.values()) {
+            const item = await this.getListenTogetherItem(user, party.libraryItemId, party.episodeId)
+            if (item.error) continue
+            users.push({
+              id: user.id,
+              username: user.username,
+              inParty: [...party.members.values()].some((m) => m.userId === user.id)
+            })
+          }
+          users.sort((a, b) => a.username.localeCompare(b.username))
+          return respond({ users })
+        }
+      }
+    } catch (error) {
+      Logger.error(`[SocketAuthority] Failed to handle listen_together_${event}`, error)
+      respond({ error: 'Something went wrong' })
+    }
   }
 
   cancelScan(id) {

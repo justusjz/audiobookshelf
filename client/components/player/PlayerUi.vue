@@ -2,7 +2,7 @@
   <div class="w-full -mt-6">
     <div class="w-full relative mb-1">
       <div class="absolute -top-10 lg:top-0 right-0 lg:right-2 flex items-center h-full">
-        <controls-playback-speed-control v-model="playbackRate" @input="setPlaybackRate" @change="playbackRateChanged" :playbackRateIncrementDecrement="playbackRateIncrementDecrement" class="mx-2 block" />
+        <controls-playback-speed-control v-model="playbackRate" @input="(val) => setPlaybackRate(val, true)" @change="playbackRateChanged" :playbackRateIncrementDecrement="playbackRateIncrementDecrement" class="mx-2 block" />
 
         <ui-tooltip direction="bottom" :text="$strings.LabelVolume">
           <controls-volume-control ref="volumeControl" v-model="volume" @input="setVolume" class="mx-2 hidden sm:block" />
@@ -33,6 +33,12 @@
         <ui-tooltip v-if="playerQueueItems.length" direction="top" :text="$strings.LabelViewQueue">
           <button :aria-label="$strings.LabelViewQueue" class="outline-hidden text-gray-300 mx-1 lg:mx-2 hover:text-white" @mousedown.prevent @mouseup.prevent @click.stop="$emit('showPlayerQueueItems')">
             <span class="material-symbols text-2.5xl sm:text-3xl">playlist_play</span>
+          </button>
+        </ui-tooltip>
+
+        <ui-tooltip direction="top" :text="$strings.LabelListenTogether">
+          <button :aria-label="$strings.LabelListenTogether" class="outline-hidden mx-1 lg:mx-2" :class="isInListeningParty ? 'text-success hover:text-green-300' : 'text-gray-300 hover:text-white'" @mousedown.prevent @mouseup.prevent @click.stop="$store.commit('listenTogether/setShowModal', true)">
+            <span class="material-symbols text-2xl sm:text-2.5xl" :class="{ fill: isInListeningParty }">groups</span>
           </button>
         </ui-tooltip>
 
@@ -113,6 +119,9 @@ export default {
     }
   },
   computed: {
+    isInListeningParty() {
+      return this.$store.getters['listenTogether/isInParty']
+    },
     sleepTimerRemainingString() {
       if (this.sleepTimerType === this.$constants.SleepTimerTypes.CHAPTER) {
         return 'EoC'
@@ -224,21 +233,25 @@ export default {
     increasePlaybackRate() {
       if (this.playbackRate >= 10) return
       this.playbackRate = Number((this.playbackRate + this.playbackRateIncrementDecrement || 0.1).toFixed(2))
-      this.setPlaybackRate(this.playbackRate)
+      this.setPlaybackRate(this.playbackRate, true)
     },
     decreasePlaybackRate() {
       if (this.playbackRate <= 0.5) return
       this.playbackRate = Number((this.playbackRate - this.playbackRateIncrementDecrement || 0.1).toFixed(2))
-      this.setPlaybackRate(this.playbackRate)
+      this.setPlaybackRate(this.playbackRate, true)
     },
     playbackRateChanged(playbackRate) {
-      this.setPlaybackRate(playbackRate)
+      this.setPlaybackRate(playbackRate, true)
       this.$store.dispatch('user/updateUserSettings', { playbackRate }).catch((err) => {
         console.error('Failed to update settings', err)
       })
     },
-    setPlaybackRate(playbackRate) {
-      this.$emit('setPlaybackRate', playbackRate)
+    /**
+     * @param {number} playbackRate
+     * @param {boolean} [isUserAction] changed by the user (not loaded from settings)
+     */
+    setPlaybackRate(playbackRate, isUserAction = false) {
+      this.$emit('setPlaybackRate', playbackRate, isUserAction)
     },
     selectChapter(chapter) {
       this.seek(chapter.start)

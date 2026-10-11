@@ -21,6 +21,7 @@
     <modals-rssfeed-open-close-modal />
     <modals-raw-cover-preview-modal />
     <modals-share-modal />
+    <modals-listen-together-modal />
     <prompt-confirm />
     <readers-reader />
   </div>
@@ -152,6 +153,9 @@ export default {
       }
 
       this.isSocketAuthenticated = true
+
+      // Rejoin listening party after reconnecting
+      this.$listenTogether.onReconnected()
     },
     streamOpen(stream) {
       if (this.$refs.mediaPlayerContainer) this.$refs.mediaPlayerContainer.streamOpen(stream)
@@ -386,6 +390,7 @@ export default {
         this.socket = this.$root.socket
         this.isSocketConnected = this.$root.socket?.connected
         this.isFirstSocketConnection = false
+        this.$listenTogether.setSocket(this.socket)
         this.socketConnectionToastId = null
         return
       }
@@ -399,6 +404,7 @@ export default {
         path: `${this.$config.routerBasePath}/socket.io`
       })
       this.$root.socket = this.socket
+      this.$listenTogether.setSocket(this.socket)
       this.isSocketAuthenticated = false
       console.log('Socket initialized')
 
@@ -474,9 +480,27 @@ export default {
 
       this.socket.on('admin_message', this.adminMessageEvt)
 
+      // Listen together Listeners
+      this.socket.on('listen_together_state', (data) => this.$listenTogether.onState(data))
+      this.socket.on('listen_together_party', (party) => this.$listenTogether.onPartyUpdated(party))
+      this.socket.on('listen_together_ended', (data) => this.$listenTogether.onEnded(data))
+      this.socket.on('listen_together_invite', this.listenTogetherInvite)
+
       // Custom metadata provider Listeners
       this.socket.on('custom_metadata_provider_added', this.customMetadataProviderAdded)
       this.socket.on('custom_metadata_provider_removed', this.customMetadataProviderRemoved)
+    },
+    listenTogetherInvite(invite) {
+      if (this.$store.state.listenTogether.party?.id === invite.partyId) return
+      this.$toast.info(this.$getString('ToastListenTogetherInvite', [invite.username, invite.title]), {
+        toastClassName: 'cursor-pointer',
+        timeout: 30000,
+        onClick: () => {
+          this.$listenTogether.join({ partyId: invite.partyId }).catch((error) => {
+            this.$toast.error(error.message)
+          })
+        }
+      })
     },
     showUpdateToast(versionData) {
       var ignoreVersion = localStorage.getItem('ignoreVersion')

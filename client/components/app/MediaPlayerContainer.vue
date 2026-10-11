@@ -182,6 +182,10 @@ export default {
   },
   methods: {
     mediaFinished(libraryItemId, episodeId) {
+      // In a listening party only the host advances the queue, other members follow
+      const listeningParty = this.$store.state.listenTogether.party
+      if (listeningParty && listeningParty.hostUserId !== this.user?.id) return
+
       // Play next item in queue
       if (!this.playerQueueItems.length || !this.$store.state.playerQueueAutoPlay) {
         // TODO: Set media finished flag so play button will play next queue item
@@ -251,7 +255,7 @@ export default {
     },
     sleepTimerEnd() {
       this.clearSleepTimer()
-      this.playerHandler.pause()
+      this.pause()
       this.$toast.info(this.$strings.ToastSleepTimerDone)
     },
     cancelSleepTimer() {
@@ -277,23 +281,52 @@ export default {
       this.sleepTimerRemaining = Math.max(0, this.sleepTimerRemaining - amount)
     },
     playPause() {
+      const wasPlaying = this.playerHandler.playerPlaying
       this.playerHandler.playPause()
+      this.reportListenTogetherAction(wasPlaying ? 'pause' : 'play')
+    },
+    play() {
+      this.playerHandler.play()
+      this.reportListenTogetherAction('play')
+    },
+    pause() {
+      this.playerHandler.pause()
+      this.reportListenTogetherAction('pause')
     },
     jumpForward() {
-      this.playerHandler.jumpForward()
+      if (!this.playerHandler.player) return
+      this.seek(Math.min(this.playerHandler.getCurrentTime() + this.playerHandler.jumpForwardAmount, this.playerHandler.getDuration()))
     },
     jumpBackward() {
-      this.playerHandler.jumpBackward()
+      if (!this.playerHandler.player) return
+      this.seek(Math.max(0, this.playerHandler.getCurrentTime() - this.playerHandler.jumpBackwardAmount))
+    },
+    /**
+     * Send a user initiated playback change to the listening party
+     *
+     * @param {'play'|'pause'|'seek'|'rate'} action
+     * @param {number} [currentTime]
+     */
+    reportListenTogetherAction(action, currentTime) {
+      if (!this.$listenTogether.isInParty || !this.libraryItemId) return
+      this.$listenTogether.localAction(action, {
+        libraryItemId: this.libraryItemId,
+        episodeId: this.$store.state.streamEpisodeId || null,
+        currentTime: currentTime !== undefined ? currentTime : this.playerHandler.getCurrentTime(),
+        playbackRate: this.currentPlaybackRate
+      })
     },
     setVolume(volume) {
       this.playerHandler.setVolume(volume)
     },
-    setPlaybackRate(playbackRate) {
+    setPlaybackRate(playbackRate, isUserAction = false) {
       this.currentPlaybackRate = playbackRate
       this.playerHandler.setPlaybackRate(playbackRate)
+      if (isUserAction) this.reportListenTogetherAction('rate')
     },
     seek(time) {
       this.playerHandler.seek(time)
+      this.reportListenTogetherAction('seek', time)
     },
     playbackTimeUpdate(time) {
       // When updating progress from another session
@@ -329,33 +362,34 @@ export default {
       this.showBookmarksModal = false
     },
     closePlayer() {
+      this.$listenTogether.leave()
       this.playerHandler.closePlayer()
       this.$store.commit('setMediaPlaying', null)
     },
     mediaSessionPlay() {
       console.log('Media session play')
-      this.playerHandler.play()
+      this.play()
     },
     mediaSessionPause() {
       console.log('Media session pause')
-      this.playerHandler.pause()
+      this.pause()
     },
     mediaSessionStop() {
       console.log('Media session stop')
-      this.playerHandler.pause()
+      this.pause()
     },
     mediaSessionSeekBackward() {
       console.log('Media session seek backward')
-      this.playerHandler.jumpBackward()
+      this.jumpBackward()
     },
     mediaSessionSeekForward() {
       console.log('Media session seek forward')
-      this.playerHandler.jumpForward()
+      this.jumpForward()
     },
     mediaSessionSeekTo(e) {
       console.log('Media session seek to', e)
       if (e.seekTime !== null && !isNaN(e.seekTime)) {
-        this.playerHandler.seek(e.seekTime)
+        this.seek(e.seekTime)
       }
     },
     mediaSessionPreviousTrack() {
@@ -505,7 +539,7 @@ export default {
         if (payload.startTime !== null && !isNaN(payload.startTime)) {
           this.seek(payload.startTime)
         } else {
-          this.playerHandler.play()
+          this.play()
         }
         return
       }
@@ -528,10 +562,25 @@ export default {
         if (this.$refs.audioPlayer) this.$refs.audioPlayer.checkUpdateChapterTrack()
       })
 
-      this.playerHandler.load(libraryItem, episodeId, true, this.currentPlaybackRate, payload.startTime)
+      this.playerHandler.load(libraryItem, episodeId, !payload.paused, this.currentPlaybackRate, payload.startTime)
+
+      if (!payload.fromListenTogether && this.$listenTogether.isInParty) {
+        // Switch the listening party to this item
+        let currentTime = payload.startTime
+        if (currentTime === null || currentTime === undefined || isNaN(currentTime)) {
+          const progress = this.$store.getters['user/getUserMediaProgress'](libraryItemId, episodeId)
+          currentTime = progress && !progress.isFinished ? progress.currentTime || 0 : 0
+        }
+        this.$listenTogether.localAction('load', {
+          libraryItemId,
+          episodeId,
+          currentTime: Number(currentTime),
+          isPlaying: !payload.paused
+        })
+      }
     },
     pauseItem() {
-      this.playerHandler.pause()
+      this.pause()
     },
     showFailedProgressSyncs() {
       if (!isNaN(this.syncFailedToast)) this.$toast.dismiss(this.syncFailedToast)
@@ -542,8 +591,33 @@ export default {
         console.log('sessionClosedEvent closing current session', sessionId)
         this.playerHandler.resetPlayer() // Closes player without reporting to server
         this.$store.commit('setMediaPlaying', null)
+        this.$listenTogether.leave()
       }
     }
+  },
+  created() {
+    // Player interface used by listen together to apply changes from the listening party
+    this.listenTogetherPlayer = {
+      getState: () => ({
+        libraryItemId: this.playerHandler.libraryItemId,
+        episodeId: this.playerHandler.episodeId || null,
+        currentTime: this.playerHandler.getCurrentTime(),
+        duration: this.playerHandler.getDuration(),
+        isPlaying: this.playerHandler.playerPlaying,
+        isLoading: !this.playerHandler.player || !this.playerHandler.currentSessionId || ['IDLE', 'LOADING'].includes(this.playerHandler.playerState),
+        playbackRate: this.currentPlaybackRate
+      }),
+      play: () => this.playerHandler.play(),
+      pause: () => this.playerHandler.pause(),
+      seek: (time) => this.playerHandler.seek(time),
+      setPlaybackRate: (playbackRate) => {
+        this.currentPlaybackRate = playbackRate
+        this.playerHandler.setPlaybackRate(playbackRate)
+        if (this.$refs.audioPlayer) this.$refs.audioPlayer.playbackRate = playbackRate
+      },
+      loadItem: (payload) => this.playLibraryItem({ ...payload, fromListenTogether: true })
+    }
+    this.$listenTogether.attachPlayer(this.listenTogetherPlayer)
   },
   mounted() {
     this.$eventBus.$on('cast-session-active', this.castSessionActive)
@@ -554,6 +628,7 @@ export default {
     this.$eventBus.$on('pause-item', this.pauseItem)
   },
   beforeDestroy() {
+    this.$listenTogether.detachPlayer(this.listenTogetherPlayer)
     this.$eventBus.$off('cast-session-active', this.castSessionActive)
     this.$eventBus.$off('playback-seek', this.seek)
     this.$eventBus.$off('playback-time-update', this.playbackTimeUpdate)
